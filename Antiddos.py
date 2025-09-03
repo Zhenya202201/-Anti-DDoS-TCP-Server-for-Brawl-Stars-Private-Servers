@@ -2,176 +2,208 @@ import asyncio
 import time
 import random
 import string
-from collections import defaultdict
+import re
+import hashlib
+import json
+import os
+from datetime import datetime
+
+import aioredis
+import pyfiglet
 
 # Настройки
 HOST = '0.0.0.0'
 PORT = 9999
-MAX_CONNECTIONS_PER_IP = 5
-GLOBAL_CONNECTIONS_PER_SEC = 100
-TIME_WINDOW = 10  # секунд
-BAN_DURATION = 120  # секунд
+MAX_CONN_PER_IP = 5
+GLOBAL_CONN_PER_SEC = 100
+TIME_WINDOW = 10
+BAN_DURATION = 120
+MAX_FP_HITS = 5
+MAX_UNIQUE_FP_PER_IP = 20
+CLIENT_TIMEOUT = 10
+SESSION_TTL = 300
+POW_DIFFICULTY = 3
+BAN_LOG_PATH = "ban.json"
 
 # Хранилища
-ip_log = defaultdict(list)
-fingerprint_log = defaultdict(int)
-banned_ips = {}
-banned_fingerprints = set()
-global_connection_times = []
+ip_log = {}
+global_conn_times = []
+log_queue = asyncio.Queue()
+account_id_re = re.compile(r"^[a-zA-Z0-9_]{4,20}$")
 
-lock = asyncio.Lock()
+# ========== Banner ==========
+def print_banner():
+    print(f"\033[92m{pyfiglet.figlet_format('AntiDDoS-Server')}\033[0m")
 
-def generate_challenge():
-    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+# ========== Ban Logging ==========
+def load_ban_stats():
+    if os.path.exists(BAN_LOG_PATH):
+        with open(BAN_LOG_PATH, "r") as f:
+            return json.load(f)
+    return {"ips": {}, "fingerprints": {}}
 
-def extract_fingerprint(data):
-    try:
-        parts = data.strip().split(':')
-        if len(parts) != 2:
-            return None
-        account_id = parts[0]
-        return f"{account_id.lower()}_{len(data)}"
-    except:
+def save_ban_stats(stats):
+    with open(BAN_LOG_PATH, "w") as f:
+        json.dump(stats, f, indent=4)
+
+def update_ban_stat_ip(ip):
+    stats = load_ban_stats()
+    entry = stats["ips"].get(ip, {"count": 0})
+    entry["count"] += 1
+    entry["last_ban"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    stats["ips"][ip] = entry
+    save_ban_stats(stats)
+
+def update_ban_stat_fp(fp):
+    stats = load_ban_stats()
+    entry = stats["fingerprints"].get(fp, {"count": 0})
+    entry["count"] += 1
+    entry["last_ban"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    stats["fingerprints"][fp] = entry
+    save_ban_stats(stats)
+
+# ========== Вспомогательные ==========
+def extract_fp(data: str, ip: str) -> str | None:
+    parts = data.strip().split(':')
+    if len(parts) != 2:
         return None
+    return hashlib.sha256(f"{ip}:{parts[0].lower()}".encode()).hexdigest()
 
-def is_banned(ip):
-    if ip in banned_ips:
-        if time.time() - banned_ips[ip] > BAN_DURATION:
-            del banned_ips[ip]
-            return False
-        return True
-    return False
+def gen_pow():
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
 
-def is_ip_rate_limited(ip):
-    now = time.time()
-    ip_log[ip] = [t for t in ip_log[ip] if now - t < TIME_WINDOW]
-    if len(ip_log[ip]) >= MAX_CONNECTIONS_PER_IP:
-        return True
-    ip_log[ip].append(now)
-    return False
-
-def is_global_rate_limited():
-    now = time.time()
-    global_connection_times[:] = [t for t in global_connection_times if now - t < 1]
-    if len(global_connection_times) >= GLOBAL_CONNECTIONS_PER_SEC:
-        return True
-    global_connection_times.append(now)
-    return False
+def valid_pow(challenge: str, sol: str) -> bool:
+    return hashlib.sha256((challenge + sol).encode()).hexdigest().startswith('0' * POW_DIFFICULTY)
 
 async def slow_read(reader, max_bytes=64, delay=0.01):
-    """Медленное чтение из сокета — полезно против спамеров"""
     data = b''
     try:
         while len(data) < max_bytes:
             chunk = await asyncio.wait_for(reader.read(1), timeout=5)
-            if not chunk or chunk == b'\n':
+            if not chunk:
                 break
             data += chunk
-            await asyncio.sleep(delay)  # задержка
+            await asyncio.sleep(delay)
         return data.decode(errors='ignore').strip()
     except:
         return ""
 
-async def handle_client(reader, writer):
-    addr = writer.get_extra_info("peername")
-    ip = addr[0]
+async def log_writer():
+    while True:
+        print(await log_queue.get())
 
-    async with lock:
-        if is_banned(ip):
-            print(f"[!] Блок: {ip}")
-            writer.close()
-            await writer.wait_closed()
+def rate_limit_ip(ip: str) -> bool:
+    now = time.time()
+    times = [t for t in ip_log.get(ip, []) if now - t < TIME_WINDOW]
+    times.append(now)
+    ip_log[ip] = times
+    return len(times) > MAX_CONN_PER_IP
+
+def global_rate_limit() -> bool:
+    now = time.time()
+    global_conn_times[:] = [t for t in global_conn_times if now - t < 1]
+    global_conn_times.append(now)
+    return len(global_conn_times) > GLOBAL_CONN_PER_SEC
+
+# ========== Основной хендлер ==========
+async def handle_client(reader, writer, redis):
+    ip = writer.get_extra_info("peername")[0]
+    async def core():
+        if await redis.exists(f"ban:ip:{ip}"):
+            update_ban_stat_ip(ip)
+            await log_queue.put(f"[BAN] IP: {ip}")
             return
 
-        if is_global_rate_limited():
-            print(f"[!] Глобальный лимит соединений")
-            writer.close()
-            await writer.wait_closed()
+        if global_rate_limit() or rate_limit_ip(ip):
+            await redis.setex(f"ban:ip:{ip}", BAN_DURATION, "1")
+            update_ban_stat_ip(ip)
+            await log_queue.put(f"[BAN-LIMIT] IP: {ip}")
             return
 
-        if is_ip_rate_limited(ip):
-            print(f"[!] Частые подключения от IP {ip} — бан")
-            banned_ips[ip] = time.time()
-            writer.close()
-            await writer.wait_closed()
-            return
-
-    try:
-        # === Challenge ===
-        challenge = generate_challenge()
-        writer.write(f"Challenge: {challenge}\n".encode())
+        challenge = gen_pow()
+        writer.write(f"PoW: sha256({challenge}+X) → hash starts with {'0'*POW_DIFFICULTY}\n".encode())
         await writer.drain()
 
-        response = await slow_read(reader)
-        if response != challenge:
-            writer.write(b"Invalid challenge.\n")
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
-            print(f"[!] Неверный challenge от {ip}")
+        sol = await asyncio.wait_for(reader.readline(), timeout=CLIENT_TIMEOUT)
+        if not valid_pow(challenge, sol.decode().strip()):
+            update_ban_stat_ip(ip)
             return
 
-        # === Запрос аккаунта ===
-        writer.write(b"Send your account_id:data\n")
+        token = hashlib.sha256(str(random.random()).encode()).hexdigest()
+        await redis.setex(f"session:{token}", SESSION_TTL, ip)
+        writer.write(f"TOKEN:{token}\n".encode())
         await writer.drain()
-        raw_data = await slow_read(reader, max_bytes=128)
 
-        fingerprint = extract_fingerprint(raw_data)
-        if not fingerprint:
-            writer.close()
-            await writer.wait_closed()
+        response = await asyncio.wait_for(reader.readline(), timeout=CLIENT_TIMEOUT)
+        if response.decode().strip() != token:
+            await redis.setex(f"ban:ip:{ip}", BAN_DURATION, "1")
+            update_ban_stat_ip(ip)
+            await log_queue.put(f"[BAN-TOKEN] IP: {ip}")
             return
 
-        if fingerprint in banned_fingerprints:
-            print(f"[!] Забанен fingerprint {fingerprint}")
-            writer.close()
-            await writer.wait_closed()
+        writer.write(b"Send account_id:data\n")
+        await writer.drain()
+
+        raw = await asyncio.wait_for(reader.readline(), timeout=CLIENT_TIMEOUT)
+        fp = extract_fp(raw.decode(), ip)
+        if not fp:
             return
 
-        fingerprint_log[fingerprint] += 1
-        if fingerprint_log[fingerprint] > 5:
-            banned_fingerprints.add(fingerprint)
-            print(f"[!] Fingerprint {fingerprint} забанен за спам")
-            writer.close()
-            await writer.wait_closed()
+        if await redis.exists(f"ban:fp:{fp}"):
+            update_ban_stat_fp(fp)
+            await log_queue.put(f"[BAN-FP] {fp}")
             return
 
-        parts = raw_data.strip().split(':')
-        account_id = parts[0]
-        if len(account_id) < 4 or not account_id.isalnum():
-            writer.write(b"Invalid account ID.\n")
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
-            print(f"[!] Подозрительный аккаунт от {ip}")
+        hits = int(await redis.get(f"count:fp:{fp}") or 0)
+        if hits >= MAX_FP_HITS:
+            await redis.setex(f"ban:fp:{fp}", BAN_DURATION, "1")
+            update_ban_stat_fp(fp)
+            await log_queue.put(f"[BAN-FP-SPAM] {fp}")
+            return
+        await redis.incr(f"count:fp:{fp}")
+        await redis.expire(f"count:fp:{fp}", TIME_WINDOW)
+
+        uniq = int(await redis.get(f"fp_unique:{ip}") or 0)
+        if uniq >= MAX_UNIQUE_FP_PER_IP:
+            await redis.setex(f"ban:ip:{ip}", BAN_DURATION, "1")
+            update_ban_stat_ip(ip)
+            await log_queue.put(f"[BAN-MANY-FP] IP: {ip}")
+            return
+        await redis.incr(f"fp_unique:{ip}")
+        await redis.expire(f"fp_unique:{ip}", TIME_WINDOW)
+
+        account_id = raw.decode().split(':',1)[0]
+        if not account_id_re.match(account_id):
+            await log_queue.put(f"[BAD-ID] {ip} -> {raw.decode().strip()}")
             return
 
-        print(f"[+] Подключение: {ip}, аккаунт: {account_id}")
+        await log_queue.put(f"[OK] Connected: IP {ip}, account {account_id}")
         writer.write(b"Connected successfully.\n")
         await writer.drain()
 
-    except Exception as e:
-        print(f"[!] Ошибка с {ip}: {e}")
+    try:
+        await asyncio.wait_for(core(), timeout=CLIENT_TIMEOUT * 2)
+    except asyncio.TimeoutError:
+        await redis.setex(f"ban:ip:{ip}", BAN_DURATION, "1")
+        update_ban_stat_ip(ip)
+        await log_queue.put(f"[TIMEOUT] IP: {ip}")
     finally:
         writer.close()
         await writer.wait_closed()
 
+# ========== Main ==========
 async def main():
-    server = await asyncio.start_server(
-        handle_client,
-        HOST,
-        PORT,
-        backlog=5000  # Увеличенная очередь входящих соединений
-    )
+    redis = await aioredis.from_url("redis://localhost", encoding="utf-8", decode_responses=True)
+    server = await asyncio.start_server(lambda r, w: handle_client(r, w, redis), HOST, PORT, backlog=5000)
+    asyncio.create_task(log_writer())
 
-    addrs = ', '.join(str(sock.getsockname()) for sock in server.sockets)
-    print(f"[i] Сервер слушает на {addrs}")
-
+    await log_queue.put(f"[INFO] Listening on {HOST}:{PORT}")
     async with server:
         await server.serve_forever()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
+        print_banner()
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[!] Сервер остановлен.")
+        print("\n[Stopped]")
